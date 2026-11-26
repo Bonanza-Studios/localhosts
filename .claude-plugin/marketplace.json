@@ -1,0 +1,6 @@
+{
+  "name": "localhosts",
+  "description": "See every local dev server and stop the ones you don't need",
+  "owner": { "name": "Bonanza Studios" },
+  "plugins": [{ "name": "localhosts", "source": "./" }]
+}

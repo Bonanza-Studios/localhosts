@@ -1,0 +1,8 @@
+{
+  "name": "localhosts",
+  "version": "0.1.0",
+  "description": "A panel listing the local dev servers with their directories and a Stop button for each",
+  "author": { "name": "Bonanza Studios" },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

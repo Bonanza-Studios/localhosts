@@ -1,0 +1,156 @@
+#!/bin/bash
+set -u
+
+usage() {
+  cat <<'EOF'
+Usage: localhosts                list dev servers, then ask which to stop
+       localhosts list           list only
+       localhosts stop <port>... stop the servers on these ports
+       localhosts stop all       stop every listed server
+EOF
+}
+
+collect() {
+  local listeners pids
+  listeners=$(lsof -nP -iTCP -sTCP:LISTEN -Fpn 2>/dev/null |
+    awk '/^p/ { pid = substr($0, 2) } /^n/ { port = $0; sub(/.*:/, "", port); print pid, port }' | sort -u)
+  [ -n "$listeners" ] || return 0
+  pids=$(cut -d' ' -f1 <<<"$listeners" | sort -un | paste -sd, -)
+  {
+    sed 's/^/L /' <<<"$listeners"
+    ps -o pid=,pgid=,etime=,command= -p "$pids" | sed 's/^/P /'
+    lsof -a -d cwd -p "$pids" -Fn 2>/dev/null | sed 's/^/C /'
+  } | awk -v home="$HOME" '
+    function uptime(e,   i, d, n, t, h, m) {
+      d = 0
+      if ((i = index(e, "-")) > 0) { d = substr(e, 1, i - 1) + 0; e = substr(e, i + 1) }
+      n = split(e, t, ":")
+      h = (n == 3) ? t[1] + 0 : 0
+      m = t[n - 1] + 0
+      if (d) return d "d " h "h"
+      if (h) return h "h " m "m"
+      return m "m"
+    }
+    function short(c,   w, b) {
+      split(c, w, " ")
+      b = w[1]; sub(/.*\//, "", b)
+      if (b ~ /^(node|bun|deno)$/ && w[2] ~ /\//) { sub(/^[^ ]+ +/, "", c); b = w[2]; sub(/.*\//, "", b) }
+      sub(/^[^ ]+/, "", c)
+      c = b c
+      return length(c) > 30 ? substr(c, 1, 29) "…" : c
+    }
+    $1 == "L" { port[$2] = port[$2] " " $3; next }
+    $1 == "P" { pgid[$2] = $3; etime[$2] = $4; c = $0; sub(/^P +[0-9]+ +[0-9]+ +[^ ]+ +/, "", c); cmd[$2] = c; next }
+    $1 == "C" && $2 ~ /^p/ { cp = substr($2, 2); next }
+    $1 == "C" && $2 ~ /^n/ { c = $0; sub(/^C n/, "", c); cwd[cp] = c }
+    END {
+      for (pid in port) {
+        if (index(cwd[pid], home "/") != 1 || cmd[pid] ~ /\.app\/Contents\//) continue
+        s = short(cmd[pid])
+        if (s ~ /^claude( |$)/) continue
+        n = split(port[pid], pp, " ")
+        for (i = 1; i <= n; i++)
+          printf "%s\t%s\t%s\t%s\t%s\t%s\n", pp[i], pgid[pid], pid, uptime(etime[pid]), cwd[pid], s
+      }
+    }' | sort -t$'\t' -k1,1n -k2,2n | awk -F'\t' -v OFS='\t' '
+    function add(list, x) { return index("," list ",", "," x ",") ? list : list "," x }
+    !($2 in ports) { order[++n] = $2; ports[$2] = $1; pids[$2] = $3; up[$2] = $4; dir[$2] = $5; cmd[$2] = $6; next }
+    { ports[$2] = add(ports[$2], $1); pids[$2] = add(pids[$2], $3) }
+    END { for (i = 1; i <= n; i++) { g = order[i]; print g, ports[g], up[g], dir[g], cmd[g], pids[g] } }'
+}
+
+print_table() {
+  if [ "$count" -eq 0 ]; then echo "No local dev servers running."; return; fi
+  awk -F'\t' -v home="$HOME" '
+    BEGIN { fmt = "%-3s %-23s %-7s %-31s %s\n"; printf fmt, "#", "URL", "UP", "COMMAND", "DIRECTORY" }
+    {
+      n = split($2, p, ","); url = "http://localhost:" p[1]
+      for (i = 2; i <= n; i++) url = url " +" p[i]
+      dir = $4; if (index(dir, home "/") == 1) dir = "~" substr(dir, length(home) + 1)
+      printf fmt, NR, url, $3, $5, dir
+    }' <<<"$rows"
+}
+
+group_is_safe() {
+  [ "$1" -gt 1 ] && [ "$1" != "$own_pgid" ] || return 1
+  ps -A -o pgid=,command= | awk -v g="$1" '
+    $1 != g { next }
+    { b = $2; sub(/.*\//, "", b); sub(/^-/, "", b); b2 = $3; sub(/.*\//, "", b2) }
+    b == "claude" || b2 == "claude" || (b ~ /^(zsh|bash|sh|fish|dash|ksh|tcsh|csh)$/ && $0 !~ / -c /) { bad = 1 }
+    END { exit bad }'
+}
+
+alive() {
+  ps -A -o pid=,pgid=,stat= |
+    awk -v t=" $1 " '$3 !~ /^Z/ && (index(t, " " $1 " ") || index(t, " -" $2 " ")) { f = 1 } END { exit !f }'
+}
+
+stop_row() {
+  local pgid=$1 ports=$2 dir=$3 pids=$4 targets label
+  case $dir in "$HOME"/*) dir="~${dir#"$HOME"}" ;; esac
+  label="localhost:${ports//,/ +} ($dir)"
+  if group_is_safe "$pgid"; then targets="-$pgid"; else targets=${pids//,/ }; fi
+  kill -TERM -- $targets 2>/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if ! alive "$targets"; then echo "Stopped $label"; return; fi
+    sleep 0.2
+  done
+  kill -KILL -- $targets 2>/dev/null
+  echo "Force-stopped $label"
+}
+
+stop_rows() {
+  local n pgid ports dir pids
+  for n in $(printf '%s\n' "$@" | sort -un); do
+    IFS=$'\t' read -r pgid ports _ dir _ pids <<<"$(sed -n "${n}p" <<<"$rows")"
+    stop_row "$pgid" "$ports" "$dir" "$pids"
+  done
+}
+
+stop_ports() {
+  local arg n sel="" missing=0
+  [ $# -gt 0 ] || { usage >&2; return 1; }
+  [ "$count" -gt 0 ] || { echo "No local dev servers running."; return 0; }
+  for arg; do
+    if [ "$arg" = all ]; then sel="$sel $(seq 1 "$count")"; continue; fi
+    n=$(awk -F'\t' -v p="$arg" 'index("," $2 ",", "," p ",") { print NR; exit }' <<<"$rows")
+    if [ -n "$n" ]; then sel="$sel $n"; else echo "No dev server on port $arg" >&2; missing=1; fi
+  done
+  stop_rows $sel
+  return $missing
+}
+
+ask() {
+  local answer n sel=""
+  printf 'Stop which? (numbers, a = all, Enter = none): '
+  read -r answer || return 0
+  case $answer in
+    "") return 0 ;;
+    a | all) stop_rows $(seq 1 "$count") ;;
+    *)
+      for n in ${answer//,/ }; do
+        case $n in '' | *[!0-9]*) echo "Not a number: $n" >&2; return 1 ;; esac
+        if [ "$n" -lt 1 ] || [ "$n" -gt "$count" ]; then echo "No server #$n" >&2; return 1; fi
+        sel="$sel $n"
+      done
+      stop_rows $sel
+      ;;
+  esac
+}
+
+own_pgid=$(ps -o pgid= -p $$ | tr -d ' ')
+rows=$(collect)
+count=0
+[ -n "$rows" ] && count=$(($(wc -l <<<"$rows")))
+
+case ${1:-} in
+  "")
+    print_table
+    if [ -t 0 ] && [ -t 1 ] && [ "$count" -gt 0 ]; then ask; fi
+    ;;
+  list) print_table ;;
+  raw) if [ "$count" -gt 0 ]; then printf '%s\n' "$rows"; fi ;;
+  stop) shift; stop_ports "$@" ;;
+  -h | --help | help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac
